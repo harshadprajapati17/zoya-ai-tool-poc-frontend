@@ -33,6 +33,10 @@ type ChatResponse = {
   products: Product[];
 };
 
+type BrandConfig = {
+  greeting_message: string | null;
+};
+
 export default function Home() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([
@@ -60,6 +64,30 @@ export default function Home() {
       }
       setSessionId(existing);
     }
+  }, []);
+
+  useEffect(() => {
+    async function loadGreeting() {
+      try {
+        const res = await fetch("/api/admin/brand-config");
+        if (!res.ok) return;
+        const data = (await res.json()) as BrandConfig | null;
+        const greeting = data?.greeting_message?.trim();
+        if (!greeting) return;
+
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === "welcome" && m.role === "assistant"
+              ? { ...m, content: greeting }
+              : m,
+          ),
+        );
+      } catch {
+        // Silently ignore admin greeting load failures and keep default.
+      }
+    }
+
+    loadGreeting();
   }, []);
 
   useEffect(() => {
