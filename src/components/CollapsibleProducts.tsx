@@ -13,6 +13,7 @@ type Product = {
   collection?: string | null;
   product_details?: string | null;
   link?: string | null;
+   product_images?: string[] | null;
 };
 
 type CollapsibleProductsProps = {

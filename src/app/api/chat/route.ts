@@ -13,6 +13,8 @@ type ChatRequestBody = {
   message: string;
   sessionId?: string | null;
   history?: HistoryTurn[];
+  mode?: "chat" | "product_finder" | "tone_refinement";
+  tone?: "friendly" | "formal" | "concise" | "empathetic" | "sales";
 };
 
 type BrandConfigRow = {
@@ -81,6 +83,32 @@ type ConversationExampleRow = {
   concierge_response: string;
 };
 
+function inferMaxBudgetRupees(query: string): number | null {
+  const lower = query.toLowerCase();
+
+  // Look for phrases like "under", "below", "up to"
+  const hasBudgetCue =
+    lower.includes("under") || lower.includes("below") || lower.includes("up to");
+  if (!hasBudgetCue) return null;
+
+  // Try to capture a number, possibly with commas
+  const numberMatch = lower.match(/([\d][\d,]*)/);
+  if (!numberMatch) return null;
+
+  const rawNumber = numberMatch[1].replace(/,/g, "");
+  const numeric = Number(rawNumber);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+
+  // Detect "lakh" or "lakhs" to scale
+  const lakhMatch = lower.match(/lakh|lakhs/);
+  if (lakhMatch) {
+    return numeric * 100000;
+  }
+
+  // Otherwise assume the number is already in rupees
+  return numeric;
+}
+
 function sanitizeForPrompt(text: string | null | undefined): string {
   if (!text) return "";
   let cleaned = text.replace(/```/g, "");
@@ -126,12 +154,104 @@ export async function POST(req: NextRequest) {
     const query = body.message?.trim();
     const sessionId = body.sessionId ?? null;
     const incomingHistory = body.history ?? [];
+     const mode = body.mode ?? "chat";
+     const tone = body.tone;
 
     if (!query) {
       return NextResponse.json(
         { error: "Message is required" },
         { status: 400 },
       );
+    }
+
+    // Tone refinement path: no product search, pure rewrite of given text
+    if (mode === "tone_refinement") {
+      const systemParts: string[] = [
+        "You are the Zoya Concierge, helping internal staff refine messages to clients.",
+        "",
+        "TASK:",
+        "You will receive a single message written by a human.",
+        "Your job is to REWRITE the same message in the requested tone, WITHOUT changing the facts, prices, product names, or promises.",
+        "",
+        "ABSOLUTE RULES:",
+        "1. Do NOT introduce new products, offers, or details that are not in the original text.",
+        "2. Preserve any constraints or disclaimers (e.g., budget limits, availability, price ranges).",
+        "3. Keep the language aligned with a luxury jewelry brand (Zoya) but focused on clarity and warmth.",
+        "4. Reply with ONLY the rewritten message. Do not explain what you changed.",
+      ];
+
+      if (tone) {
+        const tonePromptMap: Record<NonNullable<ChatRequestBody["tone"]>, string> =
+          {
+            friendly:
+              "Rewrite this to sound warm, approachable, and reassuring, while remaining polished.",
+            formal:
+              "Rewrite this to sound more formal and professional, suitable for a discerning luxury client.",
+            concise:
+              "Rewrite this to be more concise and to the point, while keeping the key details and politeness.",
+            empathetic:
+              "Rewrite this to sound especially empathetic and understanding of the client's feelings or constraints.",
+            sales:
+              "Rewrite this to be gently sales-focused, highlighting appeal and desirability without being pushy.",
+          };
+        const toneInstruction = tonePromptMap[tone];
+        if (toneInstruction) {
+          systemParts.push("", "TONE INSTRUCTION:", toneInstruction);
+        }
+      }
+
+      const systemInstruction = systemParts.join("\n");
+
+      const contents = [
+        {
+          role: "user" as const,
+          parts: [
+            {
+              text: [
+                "Here is the original message. Rewrite it according to the rules above.",
+                "",
+                sanitizeForPrompt(query),
+              ].join("\n"),
+            },
+          ],
+        },
+      ];
+
+      const genResp = await gemini.models.generateContent({
+        model: "gemini-2.5-flash",
+        config: {
+          systemInstruction,
+        },
+        contents,
+      });
+
+      const candidates = (genResp as any)?.candidates ?? [];
+      const firstCandidate = candidates[0];
+
+      let answer = "";
+
+      if (firstCandidate?.content?.parts?.length) {
+        answer = firstCandidate.content.parts
+          .map((p: any) => (typeof p.text === "string" ? p.text : ""))
+          .join("")
+          .trim();
+      }
+
+      if (!answer && typeof (genResp as any).text === "string") {
+        answer = (genResp as any).text;
+      }
+      if (!answer && typeof (genResp as any).response?.text === "function") {
+        answer = (genResp as any).response.text();
+      }
+
+      if (!answer) {
+        throw new Error("Model returned an empty response for tone refinement");
+      }
+
+      return NextResponse.json({
+        answer,
+        products: [],
+      });
     }
 
     const embedResp = await gemini.models.embedContent({
@@ -154,8 +274,23 @@ export async function POST(req: NextRequest) {
       throw new Error("Vector search failed");
     }
 
+    // If the user specified a budget, infer a max budget and filter out
+    // pieces that exceed it. This applies to all modes so that even in
+    // Chat mode, product cards respect explicit budget constraints.
+    const inferredMaxBudget = inferMaxBudgetRupees(query);
+
+    let filteredProducts: any[] = products ?? [];
+    if (inferredMaxBudget !== null) {
+      filteredProducts = filteredProducts.filter((p) => {
+        if (p.price == null) return false;
+        const priceNumber = Number(p.price);
+        if (!Number.isFinite(priceNumber)) return false;
+        return priceNumber <= inferredMaxBudget;
+      });
+    }
+
     const contextLines =
-      products?.map((p: any, index: number) => {
+      filteredProducts?.map((p: any, index: number) => {
         const price = p.price
           ? `₹${Number(p.price).toLocaleString("en-IN", {
               maximumFractionDigits: 0,
@@ -246,6 +381,20 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // When we detect a budget, add an explicit guardrail so the model
+    // respects the budget when recommending pieces, regardless of mode.
+    if (inferredMaxBudget !== null) {
+      const maxDisplay = inferredMaxBudget.toLocaleString("en-IN", {
+        maximumFractionDigits: 0,
+      });
+      systemParts.push(
+        "BUDGET CONSTRAINT (product finder mode):",
+        `The customer has specified a budget of up to ₹${maxDisplay}.`,
+        "You MUST NOT recommend or describe any pieces that are clearly above this budget.",
+        "If none of the AVAILABLE PIECES fit within this budget, say so honestly and suggest that the guest explore higher budgets or different categories instead of forcing a mismatched recommendation.",
+      );
+    }
+
     const systemInstruction = systemParts.join("\n\n");
 
     // Build multi-turn contents from frontend history
@@ -269,11 +418,20 @@ export async function POST(req: NextRequest) {
     }
 
     // Ensure last message is a user turn with product context
+    const budgetLine =
+      inferredMaxBudget !== null
+        ? `BUDGET: Up to ₹${inferredMaxBudget.toLocaleString("en-IN", {
+            maximumFractionDigits: 0,
+          })}`
+        : null;
+
     const currentUserText = [
       `AVAILABLE PIECES:\n${contextLines.join("\n")}`,
-      "",
+      budgetLine,
       query,
-    ].join("\n\n");
+    ]
+      .filter(Boolean)
+      .join("\n\n");
 
     const lastContent = contents[contents.length - 1];
     if (lastContent && lastContent.role === "user") {
@@ -342,7 +500,7 @@ export async function POST(req: NextRequest) {
           session_id: sessionId,
           user_message: query,
           full_prompt: fullPrompt,
-          products_json: products ?? [],
+          products_json: filteredProducts ?? [],
           model_answer: answer,
           model_name: "gemini-2.5-flash",
           input_tokens: inputTokens,
@@ -356,7 +514,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       answer,
-      products: products ?? [],
+      products: filteredProducts ?? [],
     });
   } catch (err) {
     console.error("Chat API error:", err);

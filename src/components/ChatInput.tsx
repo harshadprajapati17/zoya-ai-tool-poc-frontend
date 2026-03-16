@@ -3,9 +3,10 @@ import { FormEvent, useState } from "react";
 type ChatInputProps = {
   onSend: (message: string) => Promise<void> | void;
   disabled?: boolean;
+  placeholder?: string;
 };
 
-export function ChatInput({ onSend, disabled }: ChatInputProps) {
+export function ChatInput({ onSend, disabled, placeholder }: ChatInputProps) {
   const [value, setValue] = useState("");
 
   async function handleSubmit(e: FormEvent) {
@@ -25,7 +26,9 @@ export function ChatInput({ onSend, disabled }: ChatInputProps) {
         type="text"
         value={value}
         onChange={(e) => setValue(e.target.value)}
-        placeholder="Ask Zoya for a piece, occasion, or style..."
+        placeholder={
+          placeholder ?? "Ask Zoya for a piece, occasion, or style..."
+        }
         className="flex-1 bg-transparent text-sm text-slate-800 placeholder:text-slate-400 focus:outline-none"
       />
       <button
